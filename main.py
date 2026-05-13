@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import argparse
+import base64
+import io
+import json
 import math
 import random
-import time
-import tkinter as tk
+import socket
+import webbrowser
+import zipfile
 from dataclasses import dataclass
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
 
 
 TERRAIN_PRESETS = {
@@ -96,25 +103,9 @@ class TerrainSettings:
     river_spacing: float
 
 
-def smoothstep(value: float) -> float:
-    value = max(0.0, min(1.0, value))
-    return value * value * (3.0 - 2.0 * value)
-
-
-def lerp(left: float, right: float, t: float) -> float:
-    return left + (right - left) * t
-
-
-def hashed_random(ix: int, iy: int, seed: int) -> float:
-    value = (
-        ix * 374761393
-        + iy * 668265263
-        + seed * 2147483647
-        + (ix * iy * 1274126177)
-    ) & 0xFFFFFFFF
-    value = (value ^ (value >> 13)) * 1274126177 & 0xFFFFFFFF
-    value = (value ^ (value >> 16)) & 0xFFFFFFFF
-    return value / 0xFFFFFFFF
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return tuple(int(color[index : index + 2], 16) for index in (0, 2, 4))
 
 
 def hashed_random_array(ix: np.ndarray, iy: np.ndarray, seed: int) -> np.ndarray:
@@ -129,19 +120,6 @@ def hashed_random_array(ix: np.ndarray, iy: np.ndarray, seed: int) -> np.ndarray
     return value.astype(np.float32) / np.float32(0xFFFFFFFF)
 
 
-def value_noise(x: float, y: float, seed: int) -> float:
-    x0 = math.floor(x)
-    y0 = math.floor(y)
-    tx = smoothstep(x - x0)
-    ty = smoothstep(y - y0)
-
-    a = hashed_random(x0, y0, seed)
-    b = hashed_random(x0 + 1, y0, seed)
-    c = hashed_random(x0, y0 + 1, seed)
-    d = hashed_random(x0 + 1, y0 + 1, seed)
-    return lerp(lerp(a, b, tx), lerp(c, d, tx), ty)
-
-
 def value_noise_array(x: np.ndarray, y: np.ndarray, seed: int) -> np.ndarray:
     x0 = np.floor(x).astype(np.int64)
     y0 = np.floor(y).astype(np.int64)
@@ -154,27 +132,9 @@ def value_noise_array(x: np.ndarray, y: np.ndarray, seed: int) -> np.ndarray:
     b = hashed_random_array(x0 + 1, y0, seed)
     c = hashed_random_array(x0, y0 + 1, seed)
     d = hashed_random_array(x0 + 1, y0 + 1, seed)
-    return (a + (b - a) * tx) + ((c + (d - c) * tx) - (a + (b - a) * tx)) * ty
-
-
-def fbm(
-    x: float,
-    y: float,
-    seed: int,
-    octaves: int,
-    persistence: float,
-    lacunarity: float,
-) -> float:
-    amplitude = 1.0
-    frequency = 1.0
-    total = 0.0
-    norm = 0.0
-    for octave in range(octaves):
-        total += value_noise(x * frequency, y * frequency, seed + octave * 1013) * amplitude
-        norm += amplitude
-        amplitude *= persistence
-        frequency *= lacunarity
-    return total / norm if norm else 0.0
+    ab = a + (b - a) * tx
+    cd = c + (d - c) * tx
+    return ab + (cd - ab) * ty
 
 
 def fbm_array(
@@ -208,7 +168,7 @@ def smooth_map(heightmap: np.ndarray, passes: int) -> np.ndarray:
     current = heightmap
     for _ in range(passes):
         padded = np.pad(current, 1, mode="edge")
-        next_map = (
+        current = (
             padded[:-2, :-2]
             + padded[:-2, 1:-1]
             + padded[:-2, 2:]
@@ -219,16 +179,7 @@ def smooth_map(heightmap: np.ndarray, passes: int) -> np.ndarray:
             + padded[2:, 1:-1]
             + padded[2:, 2:]
         ) / 10.0
-        current = next_map
     return current.astype(np.float32)
-
-
-def apply_terraces(value: float, amount: float) -> float:
-    if amount <= 0.0:
-        return value
-    steps = 8.0 + (1.0 - amount) * 20.0
-    terraced = math.floor(value * steps) / steps
-    return lerp(value, terraced, amount)
 
 
 def apply_terraces_array(values: np.ndarray, amount: float) -> np.ndarray:
@@ -285,22 +236,8 @@ def generate_heightmap(settings: TerrainSettings) -> np.ndarray:
     wy = center + np.sin(angle) * warped_radius
 
     if settings.warp_strength > 0.0:
-        warp_x = fbm_array(
-            nx * settings.warp_frequency,
-            ny * settings.warp_frequency,
-            settings.seed + 313,
-            3,
-            0.5,
-            2.0,
-        )
-        warp_y = fbm_array(
-            nx * settings.warp_frequency,
-            ny * settings.warp_frequency,
-            settings.seed + 811,
-            3,
-            0.5,
-            2.0,
-        )
+        warp_x = fbm_array(nx * settings.warp_frequency, ny * settings.warp_frequency, settings.seed + 313, 3, 0.5, 2.0)
+        warp_y = fbm_array(nx * settings.warp_frequency, ny * settings.warp_frequency, settings.seed + 811, 3, 0.5, 2.0)
         wx += (warp_x - 0.5) * settings.warp_strength * 0.45
         wy += (warp_y - 0.5) * settings.warp_strength * 0.45
 
@@ -335,27 +272,11 @@ def generate_heightmap(settings: TerrainSettings) -> np.ndarray:
         heightmap *= 0.42
 
     heightmap = apply_terraces_array(heightmap, preset["terrace"])
-
     heightmap = normalize_map(heightmap, settings.max_height)
     heightmap = carve_rivers(heightmap, settings)
     if settings.smoothing_passes:
         heightmap = smooth_map(heightmap, settings.smoothing_passes)
     return normalize_map(heightmap, settings.max_height)
-
-
-def hex_to_rgb(color: str) -> tuple[int, int, int]:
-    color = color.lstrip("#")
-    return tuple(int(color[index : index + 2], 16) for index in (0, 2, 4))
-
-
-def color_for_height(value: float, thresholds: list[float], colors: list[str]) -> tuple[int, int, int]:
-    sorted_stops = sorted(zip(thresholds, colors), key=lambda item: item[0])
-    chosen = sorted_stops[-1][1]
-    for threshold, color in sorted_stops:
-        if value <= threshold:
-            chosen = color
-            break
-    return hex_to_rgb(chosen)
 
 
 def make_splatmap(heightmap: np.ndarray, settings: TerrainSettings) -> np.ndarray:
@@ -370,407 +291,844 @@ def make_splatmap(heightmap: np.ndarray, settings: TerrainSettings) -> np.ndarra
     return sorted_colors[indexes]
 
 
-class TerrainGeneratorApp(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("Heightmap / Splatmap Generator")
-        self.geometry("1380x860")
-        self.minsize(1120, 740)
+def png_bytes(array: np.ndarray) -> bytes:
+    output = io.BytesIO()
+    Image.fromarray(array).save(output, format="PNG")
+    return output.getvalue()
 
-        self.heightmap: np.ndarray | None = None
-        self.splatmap: np.ndarray | None = None
-        self.preview_points: list[tuple[float, float, float, tuple[int, int, int]]] = []
-        self.height_preview_image: ImageTk.PhotoImage | None = None
-        self.splat_preview_image: ImageTk.PhotoImage | None = None
-        self.rotation = 0.0
-        self.last_generated = 0.0
 
-        self.shape_var = tk.StringVar(value="Realistic")
-        self.size_var = tk.IntVar(value=512)
-        self.seed_var = tk.StringVar(value=str(random.randint(1, 2_147_483_647)))
-        self.max_height_var = tk.DoubleVar(value=1.0)
-        self.smoothing_var = tk.IntVar(value=1)
-        self.layers_var = tk.IntVar(value=5)
-        self.warp_strength_var = tk.DoubleVar(value=0.28)
-        self.warp_frequency_var = tk.DoubleVar(value=3.0)
-        self.warp_twist_var = tk.DoubleVar(value=0.18)
-        self.river_frequency_var = tk.DoubleVar(value=1.8)
-        self.river_depth_var = tk.DoubleVar(value=0.12)
-        self.river_width_var = tk.DoubleVar(value=0.13)
-        self.river_spacing_var = tk.DoubleVar(value=2.4)
-        self.threshold_vars = [
-            tk.DoubleVar(value=0.22),
-            tk.DoubleVar(value=0.42),
-            tk.DoubleVar(value=0.68),
-            tk.DoubleVar(value=1.0),
-        ]
-        self.color_vars = [tk.StringVar(value=color) for _, color in SPLAT_COLORS]
+def data_url_png(array: np.ndarray) -> str:
+    return "data:image/png;base64," + base64.b64encode(png_bytes(array)).decode("ascii")
 
-        self._build_ui()
-        self.after(150, self.generate)
-        self.after(33, self.animate)
 
-    def _build_ui(self) -> None:
-        self.configure(bg="#17191d")
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=0)
-        self.rowconfigure(0, weight=1)
+def settings_from_payload(payload: dict[str, Any]) -> TerrainSettings:
+    colors = payload.get("colors") or [color for _, color in SPLAT_COLORS]
+    thresholds = payload.get("thresholds") or [0.22, 0.42, 0.68, 1.0]
+    return TerrainSettings(
+        shape=str(payload.get("shape", "Realistic")),
+        size=max(64, min(2048, int(payload.get("size", 512)))),
+        max_height=max(0.01, float(payload.get("maxHeight", 1.0))),
+        seed=int(payload.get("seed", 1337)),
+        smoothing_passes=max(0, min(12, int(payload.get("smoothingPasses", 1)))),
+        noise_layers=max(1, min(24, int(payload.get("noiseLayers", 5)))),
+        thresholds=[max(0.0, min(1.0, float(value))) for value in thresholds[:4]],
+        colors=[str(value) for value in colors[:4]],
+        warp_strength=max(0.0, min(1.5, float(payload.get("warpStrength", 0.28)))),
+        warp_frequency=max(0.1, min(12.0, float(payload.get("warpFrequency", 3.0)))),
+        warp_twist=max(0.0, min(2.0, float(payload.get("warpTwist", 0.18)))),
+        river_frequency=max(0.0, min(8.0, float(payload.get("riverFrequency", 1.8)))),
+        river_depth=max(0.0, min(1.5, float(payload.get("riverDepth", 0.12)))),
+        river_width=max(0.001, min(0.8, float(payload.get("riverWidth", 0.13)))),
+        river_spacing=max(0.1, min(8.0, float(payload.get("riverSpacing", 2.4)))),
+    )
 
-        self.canvas = tk.Canvas(self, bg="#89aeb8", highlightthickness=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
 
-        side = ttk.Frame(self, padding=10)
-        side.grid(row=0, column=1, sticky="ns")
-        side.columnconfigure(0, weight=1)
-        self._configure_style()
+def generate_payload(settings: TerrainSettings) -> dict[str, Any]:
+    heightmap = generate_heightmap(settings)
+    splatmap = make_splatmap(heightmap, settings)
+    height_pixels = np.clip(heightmap / max(0.000001, settings.max_height) * 255, 0, 255).astype(np.uint8)
+    return {
+        "size": settings.size,
+        "maxHeight": settings.max_height,
+        "heightmap": data_url_png(height_pixels),
+        "splatmap": data_url_png(splatmap.astype(np.uint8)),
+    }
 
-        ttk.Label(side, text="Terrain Shape").grid(row=0, column=0, sticky="w")
-        shape_frame = ttk.Frame(side)
-        shape_frame.grid(row=1, column=0, sticky="ew", pady=(2, 10))
-        for index, shape in enumerate(TERRAIN_PRESETS):
-            ttk.Radiobutton(
-                shape_frame,
-                text=shape,
-                variable=self.shape_var,
-                value=shape,
-                command=self.queue_generate,
-            ).grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 8))
 
-        row = 2
-        row = self._add_dropdown(side, row, "Terrain Dimensions", self.size_var, [256, 512, 1024, 2048])
-        row = self._add_slider(side, row, "Max Height (relative)", self.max_height_var, 0.1, 2.5, 0.01)
-        row = self._add_seed(side, row)
-        row = self._add_slider(side, row, "Smoothing Passes", self.smoothing_var, 0, 8, 1)
-        row = self._add_slider(side, row, "Noise Layer Stacks", self.layers_var, 1, 16, 1)
+def export_zip_bytes(settings: TerrainSettings) -> bytes:
+    heightmap = generate_heightmap(settings)
+    splatmap = make_splatmap(heightmap, settings)
+    height_pixels = np.clip(heightmap / max(0.000001, settings.max_height) * 255, 0, 255).astype(np.uint8)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr("terrain_heightmap.png", png_bytes(height_pixels))
+        zip_file.writestr("terrain_splatmap.png", png_bytes(splatmap.astype(np.uint8)))
+    return archive.getvalue()
 
-        ttk.Label(side, text="Splatmap Colors/Threshold").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        row += 1
-        self.gradient_canvas = tk.Canvas(side, height=24, width=430, highlightthickness=1, highlightbackground="#30343a")
-        self.gradient_canvas.grid(row=row, column=0, sticky="ew", pady=(2, 6))
-        self.gradient_canvas.bind("<Button-1>", self._set_nearest_threshold)
-        self.gradient_canvas.bind("<B1-Motion>", self._set_nearest_threshold)
-        row += 1
-        for index, (name, _) in enumerate(SPLAT_COLORS):
-            item = ttk.Frame(side)
-            item.grid(row=row, column=0, sticky="ew", pady=2)
-            item.columnconfigure(1, weight=1)
-            ttk.Button(item, text=name, command=lambda i=index: self.choose_color(i)).grid(row=0, column=0, sticky="w")
-            ttk.Scale(
-                item,
-                from_=0.0,
-                to=1.0,
-                variable=self.threshold_vars[index],
-                command=lambda _value: self._threshold_changed(),
-            ).grid(row=0, column=1, sticky="ew", padx=8)
-            ttk.Label(item, textvariable=self.threshold_vars[index], width=5).grid(row=0, column=2)
-            row += 1
 
-        row = self._add_separator(side, row, "Domain Warping")
-        row = self._add_slider(side, row, "Warp Strength", self.warp_strength_var, 0.0, 1.0, 0.01)
-        row = self._add_slider(side, row, "Warp Frequency", self.warp_frequency_var, 0.5, 8.0, 0.1)
-        row = self._add_slider(side, row, "Twist / Bend", self.warp_twist_var, 0.0, 1.2, 0.01)
+APP_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Heightmap / Splatmap Generator</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --panel: #23262b;
+      --panel-2: #181a1f;
+      --line: #3a3f46;
+      --text: #eff2f6;
+      --muted: #aab1bc;
+      --blue: #3d7bea;
+      --green: #32b642;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      font: 13px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111318;
+      color: var(--text);
+    }
+    #app {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 430px;
+      height: 100vh;
+    }
+    #viewport {
+      position: relative;
+      min-width: 0;
+      background: #89aeb8;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    #status {
+      position: absolute;
+      left: 14px;
+      bottom: 12px;
+      padding: 6px 9px;
+      color: #f5f7fa;
+      background: rgb(15 18 24 / 72%);
+      border: 1px solid rgb(255 255 255 / 14%);
+    }
+    aside {
+      overflow: auto;
+      background: var(--panel);
+      border-left: 1px solid #111318;
+      padding: 10px;
+    }
+    label, .label {
+      display: block;
+      color: var(--muted);
+      margin: 7px 0 3px;
+    }
+    .shape-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 4px;
+      margin-bottom: 8px;
+    }
+    .shape-grid button,
+    .actions button,
+    select,
+    input[type="text"] {
+      min-height: 28px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 4px;
+      padding: 4px 7px;
+    }
+    .shape-grid button.active {
+      border-color: var(--blue);
+      background: var(--blue);
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 52px;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--blue);
+    }
+    .swatch-row {
+      display: grid;
+      grid-template-columns: 58px 1fr 42px 44px;
+      align-items: center;
+      gap: 8px;
+      margin: 4px 0;
+    }
+    input[type="color"] {
+      width: 100%;
+      height: 26px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+    #gradient {
+      position: relative;
+      height: 24px;
+      border: 1px solid var(--line);
+      margin: 3px 0 7px;
+    }
+    #gradient i {
+      position: absolute;
+      top: 0;
+      width: 2px;
+      height: 100%;
+      background: #fff;
+      transform: translateX(-1px);
+      pointer-events: none;
+    }
+    .section-title {
+      margin-top: 10px;
+      color: #dce2ea;
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin: 12px 0 9px;
+    }
+    .actions button {
+      border-color: transparent;
+      cursor: pointer;
+    }
+    #generate { background: var(--blue); }
+    #download { background: var(--green); }
+    .previews {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .preview {
+      background: #050505;
+      aspect-ratio: 1;
+      overflow: hidden;
+    }
+    .preview img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      image-rendering: pixelated;
+    }
+    @media (max-width: 900px) {
+      #app { grid-template-columns: 1fr; grid-template-rows: 58vh 42vh; }
+      aside { border-left: 0; border-top: 1px solid #111318; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <main id="viewport">
+      <canvas id="gl"></canvas>
+      <div id="status">Starting WebGL shader preview...</div>
+    </main>
+    <aside>
+      <div class="label">Terrain Shape</div>
+      <div class="shape-grid" id="shapeGrid"></div>
 
-        row = self._add_separator(side, row, "River Carving")
-        row = self._add_slider(side, row, "River Frequency", self.river_frequency_var, 0.0, 5.0, 0.1)
-        row = self._add_slider(side, row, "River Depth", self.river_depth_var, 0.0, 0.8, 0.01)
-        row = self._add_slider(side, row, "River Width", self.river_width_var, 0.02, 0.45, 0.01)
-        row = self._add_slider(side, row, "River Spacing", self.river_spacing_var, 0.5, 6.0, 0.1)
+      <label for="size">Terrain Dimensions</label>
+      <select id="size">
+        <option value="256">256 x 256</option>
+        <option value="512" selected>512 x 512</option>
+        <option value="1024">1024 x 1024</option>
+        <option value="2048">2048 x 2048</option>
+      </select>
 
-        buttons = ttk.Frame(side)
-        buttons.grid(row=row, column=0, sticky="ew", pady=(10, 8))
-        buttons.columnconfigure((0, 1), weight=1)
-        ttk.Button(buttons, text="Generate", command=self.generate).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(buttons, text="Export PNGs", command=self.export_pngs).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        row += 1
+      <div id="controls"></div>
 
-        preview_frame = ttk.Frame(side)
-        preview_frame.grid(row=row, column=0, sticky="ew")
-        preview_frame.columnconfigure((0, 1), weight=1)
-        self.height_canvas = tk.Canvas(preview_frame, width=210, height=210, bg="#050505", highlightthickness=0)
-        self.splat_canvas = tk.Canvas(preview_frame, width=210, height=210, bg="#050505", highlightthickness=0)
-        self.height_canvas.grid(row=0, column=0, padx=(0, 5))
-        self.splat_canvas.grid(row=0, column=1, padx=(5, 0))
+      <div class="section-title">Splatmap Colors/Threshold</div>
+      <div id="gradient"></div>
+      <div id="splatRows"></div>
 
-        row += 1
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(side, textvariable=self.status_var).grid(row=row, column=0, sticky="ew", pady=(8, 0))
-        self._redraw_gradient()
+      <div class="section-title">Domain Warping</div>
+      <div id="warpControls"></div>
 
-    def _configure_style(self) -> None:
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure(".", background="#25282d", foreground="#e8eaee", fieldbackground="#15171b")
-        style.configure("TFrame", background="#25282d")
-        style.configure("TLabel", background="#25282d", foreground="#e8eaee")
-        style.configure("TButton", background="#3b73d9", foreground="#ffffff", padding=5)
-        style.configure("TRadiobutton", background="#25282d", foreground="#e8eaee")
-        style.configure("TCombobox", fieldbackground="#15171b", foreground="#e8eaee")
-        style.configure("Horizontal.TScale", background="#25282d")
+      <div class="section-title">River Carving</div>
+      <div id="riverControls"></div>
 
-    def _add_separator(self, parent: ttk.Frame, row: int, label: str) -> int:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(10, 0))
-        return row + 1
+      <div class="actions">
+        <button id="generate">Generate</button>
+        <button id="download">Export PNGs</button>
+      </div>
 
-    def _add_dropdown(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.IntVar,
-        values: list[int],
-    ) -> int:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
-        row += 1
-        dropdown = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly")
-        dropdown.grid(row=row, column=0, sticky="ew", pady=(2, 8))
-        dropdown.bind("<<ComboboxSelected>>", lambda _event: self.queue_generate())
-        return row + 1
+      <div class="previews">
+        <div class="preview"><img id="heightPreview" alt="Heightmap preview" /></div>
+        <div class="preview"><img id="splatPreview" alt="Splatmap preview" /></div>
+      </div>
+    </aside>
+  </div>
 
-    def _add_seed(self, parent: ttk.Frame, row: int) -> int:
-        ttk.Label(parent, text="Terrain Seed").grid(row=row, column=0, sticky="w")
-        row += 1
-        frame = ttk.Frame(parent)
-        frame.grid(row=row, column=0, sticky="ew", pady=(2, 8))
-        frame.columnconfigure(0, weight=1)
-        ttk.Entry(frame, textvariable=self.seed_var).grid(row=0, column=0, sticky="ew")
-        ttk.Button(frame, text="Random", command=self.randomize_seed).grid(row=0, column=1, padx=(6, 0))
-        return row + 1
+  <script type="module">
+    const shapes = ["Island", "Mountainous", "Volcanic", "Normal", "Realistic", "Sea"];
+    const splats = [
+      ["Water", "#24d6d6"],
+      ["Rock", "#c72727"],
+      ["Sand", "#e5dc23"],
+      ["Grass", "#18db28"],
+    ];
+    const state = {
+      shape: "Realistic",
+      size: 512,
+      maxHeight: 1,
+      seed: Math.floor(Math.random() * 2147483647),
+      smoothingPasses: 1,
+      noiseLayers: 5,
+      thresholds: [0.22, 0.42, 0.68, 1],
+      colors: splats.map((s) => s[1]),
+      warpStrength: 0.28,
+      warpFrequency: 3,
+      warpTwist: 0.18,
+      riverFrequency: 1.8,
+      riverDepth: 0.12,
+      riverWidth: 0.13,
+      riverSpacing: 2.4,
+    };
 
-    def _add_slider(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.Variable,
-        minimum: float,
-        maximum: float,
-        resolution: float,
-    ) -> int:
-        frame = ttk.Frame(parent)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        frame.columnconfigure(0, weight=1)
-        ttk.Label(frame, text=label).grid(row=0, column=0, sticky="w")
-        value_label = ttk.Label(frame, width=5)
-        value_label.grid(row=0, column=1, sticky="e")
+    const $ = (id) => document.getElementById(id);
+    const status = $("status");
+    const shapeGrid = $("shapeGrid");
+    const controls = $("controls");
+    const warpControls = $("warpControls");
+    const riverControls = $("riverControls");
+    const splatRows = $("splatRows");
+    const gradient = $("gradient");
+    const heightPreview = $("heightPreview");
+    const splatPreview = $("splatPreview");
 
-        def update_label(*_args: object) -> None:
-            value = variable.get()
-            if resolution >= 1:
-                value_label.configure(text=str(int(float(value))))
-            else:
-                value_label.configure(text=f"{float(value):.2f}")
+    let latestHeightUrl = "";
+    let latestSplatUrl = "";
+    let busy = false;
+    let debounce = null;
 
-        variable.trace_add("write", update_label)
-        update_label()
-        slider = ttk.Scale(
-            frame,
-            from_=minimum,
-            to=maximum,
-            variable=variable,
-            command=lambda value: self._slider_changed(variable, value, resolution),
-        )
-        slider.grid(row=1, column=0, columnspan=2, sticky="ew")
-        return row + 1
+    function control(container, key, label, min, max, step) {
+      const wrap = document.createElement("div");
+      wrap.className = "row";
+      const title = document.createElement("label");
+      title.textContent = label;
+      title.htmlFor = key;
+      title.style.gridColumn = "1 / 3";
+      const input = document.createElement("input");
+      input.type = key === "seed" ? "text" : "range";
+      input.id = key;
+      input.value = state[key];
+      const value = document.createElement("span");
+      value.textContent = String(state[key]);
+      if (input.type === "range") {
+        input.min = min;
+        input.max = max;
+        input.step = step;
+      }
+      input.addEventListener("input", () => {
+        state[key] = input.type === "range" ? Number(input.value) : input.value;
+        if (key === "seed") state[key] = Number.parseInt(input.value || "0", 10) || 0;
+        value.textContent = input.type === "range" && step < 1 ? Number(state[key]).toFixed(2) : String(state[key]);
+        queueGenerate();
+      });
+      wrap.append(title, input, value);
+      container.appendChild(wrap);
+    }
 
-    def _slider_changed(self, variable: tk.Variable, value: str, resolution: float) -> None:
-        number = float(value)
-        if resolution >= 1:
-            variable.set(int(round(number)))
-        else:
-            variable.set(round(number / resolution) * resolution)
-        self.queue_generate()
+    shapes.forEach((shape) => {
+      const button = document.createElement("button");
+      button.textContent = shape;
+      button.addEventListener("click", () => {
+        state.shape = shape;
+        document.querySelectorAll(".shape-grid button").forEach((item) => item.classList.toggle("active", item.textContent === shape));
+        queueGenerate();
+      });
+      if (shape === state.shape) button.classList.add("active");
+      shapeGrid.appendChild(button);
+    });
 
-    def _threshold_changed(self) -> None:
-        self._redraw_gradient()
-        self.queue_generate()
+    $("size").addEventListener("change", (event) => {
+      state.size = Number(event.target.value);
+      if (state.size > 512) {
+        status.textContent = "Large map selected. Press Generate when ready.";
+        return;
+      }
+      queueGenerate();
+    });
 
-    def _set_nearest_threshold(self, event: tk.Event) -> None:
-        width = max(1, self.gradient_canvas.winfo_width())
-        target = max(0.0, min(1.0, event.x / width))
-        nearest = min(
-            range(len(self.threshold_vars)),
-            key=lambda index: abs(self.threshold_vars[index].get() - target),
-        )
-        self.threshold_vars[nearest].set(round(target, 2))
-        self._threshold_changed()
+    control(controls, "maxHeight", "Max Height (relative)", 0.1, 2.5, 0.01);
+    control(controls, "seed", "Terrain Seed", 0, 0, 1);
+    control(controls, "smoothingPasses", "Smoothing Passes", 0, 8, 1);
+    control(controls, "noiseLayers", "Noise Layer Stacks", 1, 16, 1);
+    control(warpControls, "warpStrength", "Warp Strength", 0, 1, 0.01);
+    control(warpControls, "warpFrequency", "Warp Frequency", 0.5, 8, 0.1);
+    control(warpControls, "warpTwist", "Twist / Bend", 0, 1.2, 0.01);
+    control(riverControls, "riverFrequency", "River Frequency", 0, 5, 0.1);
+    control(riverControls, "riverDepth", "River Depth", 0, 0.8, 0.01);
+    control(riverControls, "riverWidth", "River Width", 0.02, 0.45, 0.01);
+    control(riverControls, "riverSpacing", "River Spacing", 0.5, 6, 0.1);
 
-    def choose_color(self, index: int) -> None:
-        color = colorchooser.askcolor(self.color_vars[index].get(), parent=self)[1]
-        if color:
-            self.color_vars[index].set(color)
-            self._redraw_gradient()
-            self.queue_generate()
+    function redrawGradient() {
+      const stops = state.thresholds.map((value, index) => `${state.colors[index]} ${Math.round(value * 100)}%`);
+      gradient.style.background = `linear-gradient(90deg, ${stops.join(", ")})`;
+      gradient.innerHTML = "";
+      state.thresholds.forEach((value) => {
+        const marker = document.createElement("i");
+        marker.style.left = `${value * 100}%`;
+        gradient.appendChild(marker);
+      });
+    }
 
-    def randomize_seed(self) -> None:
-        self.seed_var.set(str(random.randint(1, 2_147_483_647)))
-        self.queue_generate()
+    splats.forEach(([name], index) => {
+      const row = document.createElement("div");
+      row.className = "swatch-row";
+      const color = document.createElement("input");
+      color.type = "color";
+      color.value = state.colors[index];
+      const threshold = document.createElement("input");
+      threshold.type = "range";
+      threshold.min = 0;
+      threshold.max = 1;
+      threshold.step = 0.01;
+      threshold.value = state.thresholds[index];
+      const value = document.createElement("span");
+      value.textContent = state.thresholds[index].toFixed(2);
+      color.addEventListener("input", () => {
+        state.colors[index] = color.value;
+        redrawGradient();
+        renderer.setMaterialColors(state.colors);
+        queueGenerate();
+      });
+      threshold.addEventListener("input", () => {
+        state.thresholds[index] = Number(threshold.value);
+        value.textContent = state.thresholds[index].toFixed(2);
+        redrawGradient();
+        queueGenerate();
+      });
+      row.append(name, threshold, value, color);
+      splatRows.appendChild(row);
+    });
+    redrawGradient();
 
-    def queue_generate(self) -> None:
-        if int(self.size_var.get()) > 512:
-            self.status_var.set("Large map selected. Press Generate when ready.")
-            self._redraw_gradient()
+    function queueGenerate() {
+      if (state.size > 512) {
+        status.textContent = "Large map selected. Press Generate when ready.";
+        return;
+      }
+      clearTimeout(debounce);
+      debounce = setTimeout(generate, 280);
+    }
+
+    async function generate() {
+      if (busy) return;
+      busy = true;
+      status.textContent = `Generating ${state.size} x ${state.size}...`;
+      try {
+        const response = await fetch("/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(state),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        latestHeightUrl = payload.heightmap;
+        latestSplatUrl = payload.splatmap;
+        heightPreview.src = latestHeightUrl;
+        splatPreview.src = latestSplatUrl;
+        await renderer.setTextures(latestHeightUrl, latestSplatUrl, payload.maxHeight);
+        status.textContent = `Generated ${payload.size} x ${payload.size}. Preview is WebGL shader rendered.`;
+      } catch (error) {
+        status.textContent = `Generation failed: ${error.message}`;
+      } finally {
+        busy = false;
+      }
+    }
+
+    $("generate").addEventListener("click", generate);
+    $("download").addEventListener("click", async () => {
+      status.textContent = "Preparing heightmap and splatmap export...";
+      try {
+        const response = await fetch("/export", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(state),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const blob = await response.blob();
+        download(URL.createObjectURL(blob), "terrain_maps.zip", true);
+        status.textContent = "Exported terrain_maps.zip with heightmap and splatmap PNGs.";
+      } catch (error) {
+        status.textContent = `Export failed: ${error.message}`;
+      }
+    });
+
+    function download(url, name, revoke = false) {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      if (revoke) setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    class Renderer {
+      constructor(canvas) {
+        this.canvas = canvas;
+        this.gl = canvas.getContext("webgl2", { antialias: true });
+        if (!this.gl) throw new Error("WebGL2 is not available in this browser.");
+        this.rotation = 0;
+        this.heightScale = 0.45;
+        this.program = this.createProgram(vertexShader, fragmentShader);
+        this.attribs = {
+          position: this.gl.getAttribLocation(this.program, "aPosition"),
+          uv: this.gl.getAttribLocation(this.program, "aUv"),
+        };
+        this.uniforms = {
+          projection: this.gl.getUniformLocation(this.program, "uProjection"),
+          view: this.gl.getUniformLocation(this.program, "uView"),
+          model: this.gl.getUniformLocation(this.program, "uModel"),
+          heightmap: this.gl.getUniformLocation(this.program, "uHeightmap"),
+          splatmap: this.gl.getUniformLocation(this.program, "uSplatmap"),
+          heightScale: this.gl.getUniformLocation(this.program, "uHeightScale"),
+          texelSize: this.gl.getUniformLocation(this.program, "uTexelSize"),
+          materialColors: this.gl.getUniformLocation(this.program, "uMaterialColors[0]"),
+        };
+        this.buildMesh(220);
+        this.heightTexture = this.makeTexture();
+        this.splatTexture = this.makeTexture();
+        this.setMaterialColors(state.colors);
+        this.gl.enable(this.gl.DEPTH_TEST);
+        this.gl.disable(this.gl.CULL_FACE);
+        requestAnimationFrame((time) => this.frame(time));
+      }
+
+      buildMesh(resolution) {
+        const vertices = [];
+        const indices = [];
+        for (let y = 0; y <= resolution; y++) {
+          for (let x = 0; x <= resolution; x++) {
+            const u = x / resolution;
+            const v = y / resolution;
+            vertices.push((u - 0.5) * 2, (v - 0.5) * 2, u, v);
+          }
+        }
+        for (let y = 0; y < resolution; y++) {
+          for (let x = 0; x < resolution; x++) {
+            const i = y * (resolution + 1) + x;
+            indices.push(i, i + 1, i + resolution + 1, i + 1, i + resolution + 2, i + resolution + 1);
+          }
+        }
+        const gl = this.gl;
+        this.indexCount = indices.length;
+        this.vao = gl.createVertexArray();
+        gl.bindVertexArray(this.vao);
+        const vertexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(this.attribs.position);
+        gl.vertexAttribPointer(this.attribs.position, 2, gl.FLOAT, false, 16, 0);
+        gl.enableVertexAttribArray(this.attribs.uv);
+        gl.vertexAttribPointer(this.attribs.uv, 2, gl.FLOAT, false, 16, 8);
+        const indexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(indices), gl.STATIC_DRAW);
+        gl.bindVertexArray(null);
+      }
+
+      createProgram(vs, fs) {
+        const gl = this.gl;
+        const vertex = this.compile(gl.VERTEX_SHADER, vs);
+        const fragment = this.compile(gl.FRAGMENT_SHADER, fs);
+        const program = gl.createProgram();
+        gl.attachShader(program, vertex);
+        gl.attachShader(program, fragment);
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          throw new Error(gl.getProgramInfoLog(program));
+        }
+        return program;
+      }
+
+      compile(type, source) {
+        const gl = this.gl;
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          throw new Error(gl.getShaderInfoLog(shader));
+        }
+        return shader;
+      }
+
+      makeTexture() {
+        const gl = this.gl;
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+        return texture;
+      }
+
+      imageFromUrl(url) {
+        return new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = reject;
+          image.src = url;
+        });
+      }
+
+      async setTextures(heightUrl, splatUrl, maxHeight) {
+        const [heightImage, splatImage] = await Promise.all([this.imageFromUrl(heightUrl), this.imageFromUrl(splatUrl)]);
+        const gl = this.gl;
+        gl.bindTexture(gl.TEXTURE_2D, this.heightTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, gl.RED, gl.UNSIGNED_BYTE, heightImage);
+        gl.bindTexture(gl.TEXTURE_2D, this.splatTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, splatImage);
+        this.texelSize = [1 / heightImage.width, 1 / heightImage.height];
+        this.heightScale = 0.28 + maxHeight * 0.28;
+      }
+
+      setMaterialColors(colors) {
+        const values = colors.flatMap((color) => {
+          const n = Number.parseInt(color.slice(1), 16);
+          return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+        });
+        this.materialColors = new Float32Array(values);
+      }
+
+      resize() {
+        const width = Math.max(1, Math.floor(this.canvas.clientWidth * devicePixelRatio));
+        const height = Math.max(1, Math.floor(this.canvas.clientHeight * devicePixelRatio));
+        if (this.canvas.width !== width || this.canvas.height !== height) {
+          this.canvas.width = width;
+          this.canvas.height = height;
+          this.gl.viewport(0, 0, width, height);
+        }
+      }
+
+      frame() {
+        this.resize();
+        this.rotation += 0.0045;
+        const gl = this.gl;
+        gl.clearColor(0.50, 0.66, 0.70, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.useProgram(this.program);
+        const aspect = this.canvas.width / this.canvas.height;
+        gl.uniformMatrix4fv(this.uniforms.projection, false, perspective(42 * Math.PI / 180, aspect, 0.1, 20));
+        gl.uniformMatrix4fv(this.uniforms.view, false, lookAt([0, 1.65, 3.15], [0, 0.05, 0], [0, 1, 0]));
+        gl.uniformMatrix4fv(this.uniforms.model, false, multiply(rotateY(this.rotation), rotateX(-0.55)));
+        gl.uniform1f(this.uniforms.heightScale, this.heightScale);
+        gl.uniform2fv(this.uniforms.texelSize, this.texelSize || [1 / 512, 1 / 512]);
+        gl.uniform3fv(this.uniforms.materialColors, this.materialColors);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.heightTexture);
+        gl.uniform1i(this.uniforms.heightmap, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.splatTexture);
+        gl.uniform1i(this.uniforms.splatmap, 1);
+        gl.bindVertexArray(this.vao);
+        gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_INT, 0);
+        requestAnimationFrame((time) => this.frame(time));
+      }
+    }
+
+    const vertexShader = `#version 300 es
+      precision highp float;
+      in vec2 aPosition;
+      in vec2 aUv;
+      uniform sampler2D uHeightmap;
+      uniform mat4 uProjection;
+      uniform mat4 uView;
+      uniform mat4 uModel;
+      uniform float uHeightScale;
+      uniform vec2 uTexelSize;
+      out vec2 vUv;
+      out vec3 vNormal;
+      out float vHeight;
+      void main() {
+        float h = texture(uHeightmap, aUv).r;
+        float hx = texture(uHeightmap, aUv + vec2(uTexelSize.x, 0.0)).r - texture(uHeightmap, aUv - vec2(uTexelSize.x, 0.0)).r;
+        float hy = texture(uHeightmap, aUv + vec2(0.0, uTexelSize.y)).r - texture(uHeightmap, aUv - vec2(0.0, uTexelSize.y)).r;
+        vec3 normal = normalize(vec3(-hx * uHeightScale * 8.0, 0.16, -hy * uHeightScale * 8.0));
+        vec3 position = vec3(aPosition.x, h * uHeightScale, aPosition.y);
+        vUv = aUv;
+        vHeight = h;
+        vNormal = mat3(uModel) * normal;
+        gl_Position = uProjection * uView * uModel * vec4(position, 1.0);
+      }
+    `;
+
+    const fragmentShader = `#version 300 es
+      precision highp float;
+      uniform sampler2D uSplatmap;
+      uniform vec3 uMaterialColors[4];
+      in vec2 vUv;
+      in vec3 vNormal;
+      in float vHeight;
+      out vec4 outColor;
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+      }
+      float colorMask(vec3 splat, vec3 target) {
+        return 1.0 - smoothstep(0.08, 0.45, distance(splat, target));
+      }
+      void main() {
+        vec3 splat = texture(uSplatmap, vUv).rgb;
+        float water = colorMask(splat, uMaterialColors[0]);
+        float rock = colorMask(splat, uMaterialColors[1]);
+        float sand = colorMask(splat, uMaterialColors[2]);
+        float grass = colorMask(splat, uMaterialColors[3]);
+        float total = max(0.0001, water + rock + sand + grass);
+        vec2 tiled = vUv * 52.0;
+        float grain = hash(floor(tiled));
+        vec3 waterColor = mix(vec3(0.02, 0.38, 0.48), vec3(0.06, 0.78, 0.82), 0.45 + grain * 0.2);
+        vec3 rockColor = mix(vec3(0.30, 0.29, 0.27), vec3(0.58, 0.56, 0.50), grain);
+        vec3 sandColor = mix(vec3(0.68, 0.60, 0.34), vec3(0.88, 0.82, 0.50), grain);
+        vec3 grassColor = mix(vec3(0.15, 0.36, 0.13), vec3(0.45, 0.61, 0.22), grain);
+        vec3 base = (waterColor * water + rockColor * rock + sandColor * sand + grassColor * grass) / total;
+        vec3 normal = normalize(vNormal);
+        vec3 lightDir = normalize(vec3(0.35, 0.85, 0.42));
+        float diffuse = max(dot(normal, lightDir), 0.0);
+        float slope = 1.0 - clamp(normal.y, 0.0, 1.0);
+        base = mix(base, rockColor, smoothstep(0.42, 0.82, slope) * 0.55);
+        base += vec3(0.08, 0.09, 0.10) * smoothstep(0.72, 1.0, vHeight);
+        outColor = vec4(base * (0.38 + diffuse * 0.78), 1.0);
+      }
+    `;
+
+    function perspective(fovy, aspect, near, far) {
+      const f = 1 / Math.tan(fovy / 2);
+      const nf = 1 / (near - far);
+      return new Float32Array([
+        f / aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far + near) * nf, -1,
+        0, 0, 2 * far * near * nf, 0,
+      ]);
+    }
+
+    function lookAt(eye, center, up) {
+      const z = normalize([eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]]);
+      const x = normalize(cross(up, z));
+      const y = cross(z, x);
+      return new Float32Array([
+        x[0], y[0], z[0], 0,
+        x[1], y[1], z[1], 0,
+        x[2], y[2], z[2], 0,
+        -dot(x, eye), -dot(y, eye), -dot(z, eye), 1,
+      ]);
+    }
+
+    function rotateX(angle) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
+    }
+
+    function rotateY(angle) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
+    }
+
+    function multiply(a, b) {
+      const out = new Float32Array(16);
+      for (let row = 0; row < 4; row++) {
+        for (let col = 0; col < 4; col++) {
+          out[col * 4 + row] =
+            a[0 * 4 + row] * b[col * 4 + 0] +
+            a[1 * 4 + row] * b[col * 4 + 1] +
+            a[2 * 4 + row] * b[col * 4 + 2] +
+            a[3 * 4 + row] * b[col * 4 + 3];
+        }
+      }
+      return out;
+    }
+
+    function normalize(v) {
+      const length = Math.hypot(...v) || 1;
+      return v.map((value) => value / length);
+    }
+
+    function cross(a, b) {
+      return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    }
+
+    function dot(a, b) {
+      return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    }
+
+    const renderer = new Renderer($("gl"));
+    generate();
+  </script>
+</body>
+</html>
+"""
+
+
+class TerrainRequestHandler(BaseHTTPRequestHandler):
+    server_version = "HSTerrain/0.2"
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path != "/":
+            self.send_error(404)
             return
-        if time.time() - self.last_generated > 0.35:
-            self.after(80, self.generate)
+        self.send_bytes(APP_HTML.encode("utf-8"), "text/html; charset=utf-8")
 
-    def settings(self) -> TerrainSettings:
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path not in {"/generate", "/export"}:
+            self.send_error(404)
+            return
         try:
-            seed = int(self.seed_var.get())
-        except ValueError:
-            seed = abs(hash(self.seed_var.get())) % 2_147_483_647
-        return TerrainSettings(
-            shape=self.shape_var.get(),
-            size=int(self.size_var.get()),
-            max_height=float(self.max_height_var.get()),
-            seed=seed,
-            smoothing_passes=int(self.smoothing_var.get()),
-            noise_layers=int(self.layers_var.get()),
-            thresholds=[float(var.get()) for var in self.threshold_vars],
-            colors=[var.get() for var in self.color_vars],
-            warp_strength=float(self.warp_strength_var.get()),
-            warp_frequency=float(self.warp_frequency_var.get()),
-            warp_twist=float(self.warp_twist_var.get()),
-            river_frequency=float(self.river_frequency_var.get()),
-            river_depth=float(self.river_depth_var.get()),
-            river_width=float(self.river_width_var.get()),
-            river_spacing=float(self.river_spacing_var.get()),
-        )
-
-    def generate(self) -> None:
-        self.last_generated = time.time()
-        settings = self.settings()
-        self.status_var.set(f"Generating {settings.size}x{settings.size}...")
-        self.update_idletasks()
-        self.heightmap = generate_heightmap(settings)
-        self.splatmap = make_splatmap(self.heightmap, settings)
-        self.preview_points = self._build_preview_points(self.heightmap, self.splatmap, settings.max_height)
-        self.draw_previews()
-        self.status_var.set(f"Generated {settings.size}x{settings.size} terrain")
-
-    def _build_preview_points(
-        self,
-        heightmap: np.ndarray,
-        splatmap: np.ndarray,
-        max_height: float,
-    ) -> list[tuple[float, float, float, tuple[int, int, int]]]:
-        size = heightmap.shape[0]
-        stride = max(1, size // 72)
-        points = []
-        for y in range(0, size, stride):
-            for x in range(0, size, stride):
-                px = (x / max(1, size - 1) - 0.5) * 2.0
-                py = (y / max(1, size - 1) - 0.5) * 2.0
-                pz = float(heightmap[y, x] / max(0.000001, max_height))
-                points.append((px, py, pz, tuple(int(channel) for channel in splatmap[y, x])))
-        return points
-
-    def draw_previews(self) -> None:
-        if self.heightmap is None or self.splatmap is None:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            settings = settings_from_payload(payload)
+            if path == "/export":
+                archive = export_zip_bytes(settings)
+                self.send_bytes(archive, "application/zip", "attachment; filename=terrain_maps.zip")
+                return
+            response = generate_payload(settings)
+        except Exception as exc:
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(str(exc).encode("utf-8"))
             return
-        settings = self.settings()
-        grayscale = np.clip(self.heightmap / max(0.000001, settings.max_height) * 255, 0, 255).astype(np.uint8)
-        height_rgb = np.repeat(grayscale[:, :, None], 3, axis=2)
-        self.height_preview_image = self._canvas_image(self.height_canvas, height_rgb)
-        self.splat_preview_image = self._canvas_image(self.splat_canvas, self.splatmap.astype(np.uint8))
-        self._redraw_gradient()
+        self.send_bytes(json.dumps(response).encode("utf-8"), "application/json")
 
-    def _canvas_image(self, canvas: tk.Canvas, data: np.ndarray) -> ImageTk.PhotoImage:
-        canvas.delete("all")
-        width = int(canvas["width"])
-        height = int(canvas["height"])
-        image = Image.fromarray(data).resize((width, height), Image.Resampling.NEAREST)
-        photo = ImageTk.PhotoImage(image)
-        canvas.create_image(0, 0, anchor="nw", image=photo)
-        return photo
+    def log_message(self, format: str, *args: Any) -> None:
+        return
 
-    def _redraw_gradient(self) -> None:
-        width = max(1, self.gradient_canvas.winfo_width())
-        height = max(1, self.gradient_canvas.winfo_height())
-        self.gradient_canvas.delete("all")
-        thresholds = [var.get() for var in self.threshold_vars]
-        colors = [var.get() for var in self.color_vars]
-        for x in range(width):
-            value = x / max(1, width - 1)
-            color = color_for_height(value, thresholds, colors)
-            fill = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
-            self.gradient_canvas.create_line(x, 0, x, height, fill=fill)
-        for threshold in thresholds:
-            px = int(threshold * width)
-            self.gradient_canvas.create_line(px, 0, px, height, fill="#ffffff", width=2)
+    def send_bytes(self, body: bytes, content_type: str, disposition: str | None = None) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if disposition:
+            self.send_header("Content-Disposition", disposition)
+        self.end_headers()
+        self.wfile.write(body)
 
-    def animate(self) -> None:
-        self.rotation += 0.012
-        self.draw_terrain()
-        self.after(33, self.animate)
 
-    def draw_terrain(self) -> None:
-        self.canvas.delete("all")
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        if not self.preview_points:
-            self.canvas.create_text(width / 2, height / 2, text="Generating terrain...", fill="#ffffff", font=("Arial", 22))
-            return
-
-        self._draw_grid(width, height)
-        cos_a = math.cos(self.rotation)
-        sin_a = math.sin(self.rotation)
-        scale = min(width, height) * 0.32
-        projected = []
-        for x, y, z, color in self.preview_points:
-            rx = x * cos_a - y * sin_a
-            ry = x * sin_a + y * cos_a
-            sx = width / 2 + (rx - ry) * scale * 0.75
-            sy = height / 2 + (rx + ry) * scale * 0.25 - z * scale * 0.45
-            shade = 0.72 + min(0.28, z * 0.28)
-            shaded = tuple(max(0, min(255, int(channel * shade))) for channel in color)
-            projected.append((sy, sx, sy, shaded, z))
-
-        projected.sort(key=lambda item: item[0])
-        point_size = max(2, int(scale / 70))
-        for _depth, sx, sy, color, z in projected:
-            fill = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
-            radius = point_size + int(z * 2)
-            self.canvas.create_oval(sx - radius, sy - radius, sx + radius, sy + radius, fill=fill, outline=fill)
-
-    def _draw_grid(self, width: int, height: int) -> None:
-        center_x = width / 2
-        base_y = height * 0.68
-        color = "#9fc0c8"
-        for index in range(-12, 13):
-            offset = index * 32
-            self.canvas.create_line(center_x - 520 + offset, base_y - 170, center_x + 520 + offset, base_y + 170, fill=color)
-            self.canvas.create_line(center_x - 520 + offset, base_y + 170, center_x + 520 + offset, base_y - 170, fill=color)
-
-    def export_pngs(self) -> None:
-        if self.heightmap is None or self.splatmap is None:
-            self.generate()
-        if self.heightmap is None or self.splatmap is None:
-            return
-
-        base_path = filedialog.asksaveasfilename(
-            parent=self,
-            title="Export heightmap and splatmap",
-            defaultextension=".png",
-            filetypes=[("PNG images", "*.png")],
-            initialfile="terrain.png",
-        )
-        if not base_path:
-            return
-        if base_path.lower().endswith(".png"):
-            base_path = base_path[:-4]
-
-        max_height = max(0.000001, self.settings().max_height)
-        height_pixels = np.clip(self.heightmap / max_height * 255, 0, 255).astype(np.uint8)
-        height_path = f"{base_path}_heightmap.png"
-        splat_path = f"{base_path}_splatmap.png"
-        Image.fromarray(height_pixels).save(height_path)
-        Image.fromarray(self.splatmap.astype(np.uint8)).save(splat_path)
-        messagebox.showinfo("Export complete", f"Saved:\n{height_path}\n{splat_path}", parent=self)
+def available_port(preferred: int) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
 
 
 def main() -> None:
-    app = TerrainGeneratorApp()
-    app.mainloop()
+    parser = argparse.ArgumentParser(description="Heightmap / Splatmap generator with WebGL shader preview.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--open", action="store_true", help="Open the app in the default browser.")
+    args = parser.parse_args()
+
+    port = available_port(args.port)
+    server = ThreadingHTTPServer((args.host, port), TerrainRequestHandler)
+    url = f"http://{args.host}:{port}/"
+    print(f"Heightmap / Splatmap Generator running at {url}")
+    print("Press Ctrl+C to stop.")
+    if args.open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping server.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
